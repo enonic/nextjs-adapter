@@ -6,9 +6,12 @@ import adapterConstants, {
     FRAGMENT_CONTENTTYPE_NAME,
     FRAGMENT_DEFAULT_REGION_NAME,
     getContentApiUrl,
+    getJsessionHeaders,
+    getRenderMode,
+    getSingleComponentPath,
     getXpBaseUrl,
+    getXPRequestType,
     IS_DEV_MODE,
-    JSESSIONID_HEADER,
     PAGE_TEMPLATE_CONTENTTYPE_NAME,
     PAGE_TEMPLATE_FOLDER,
     RENDER_MODE,
@@ -27,9 +30,6 @@ export type AdapterConstants = {
     APP_NAME: string,
     APP_NAME_DASHED: string,
     SITE_KEY: string,
-    getXPRequestType: (context?: Context) => XP_REQUEST_TYPE,
-    getRenderMode: (context?: Context) => RENDER_MODE,
-    getSingleComponentPath: (context?: Context) => string | undefined,
 };
 
 type Result = {
@@ -104,8 +104,13 @@ export interface MinimalContext {
  * @param contentPath string or string array: pre-split or slash-delimited _path to a content available on the API
  * @returns FetchContentResult object: {data?: T, error?: {code, message}}
  */
-export type ContentFetcher = (contentPath: string | string[], context: Context) => Promise<FetchContentResult>;
-
+export type ContentFetcher = (siteRelativeContentPath: string,
+                              componentPath: string,
+                              requestType: XP_REQUEST_TYPE,
+                              renderMode: RENDER_MODE,
+                              contentApiUrl: string,
+                              xpBaseUrl: string,
+                              context: Context) => Promise<FetchContentResult>;
 
 const NO_PROPS_PROCESSOR = async (props: any) => await props ?? {};
 
@@ -523,7 +528,6 @@ async function applyProcessors(componentDescriptors: ComponentDescriptor[], cont
 
 function collectComponentDescriptors(components: PageComponent[],
                                      componentRegistry: typeof ComponentRegistry,
-                                     requestedComponentPath: string | undefined,
                                      xpContentPath: string,
                                      context: Context | undefined,
 ): ComponentDescriptor[] {
@@ -551,8 +555,7 @@ function collectComponentDescriptors(components: PageComponent[],
             }
         } else {
             // look for parts inside fragments
-            const fragPartDescs = collectComponentDescriptors(cmp.fragment.fragment.components, componentRegistry, requestedComponentPath,
-                xpContentPath, context);
+            const fragPartDescs = collectComponentDescriptors(cmp.fragment.fragment.components, componentRegistry, xpContentPath, context);
             if (fragPartDescs.length) {
                 descriptors.push(...fragPartDescs);
             }
@@ -631,10 +634,13 @@ function getQueryAndVariables(type: string,
 }
 
 
-function createPageData(contentType: string, components?: PageComponent[]): PageComponent | undefined {
+function createPageData(contentType: string, components: PageComponent[], componentPath?: string): PageComponent | undefined {
     let page;
-    if (components) {
+    if (components && !componentPath) {
         page = buildPage(contentType, components);
+    } else {
+        // Don't build page for single component
+        page = null;
     }
     return page as PageComponent;
 }
@@ -654,7 +660,7 @@ function createMetaData(contentType: string, contentPath: string,
         requestType: requestType,
         renderMode: renderMode,
         canRender: false,
-        catchAll: false,
+        catchAll: false,  // catchAll only refers to content type catch-all
         apiUrl,
         baseUrl,
     };
@@ -667,10 +673,12 @@ function createMetaData(contentType: string, contentPath: string,
     const typeDef = ComponentRegistry.getContentType(contentType);
     if (typeDef?.view && !typeDef.catchAll) {
         meta.canRender = true;
-    } else if (pageDesc) {
-        // always render a page if there is a descriptor (show missing in case it's not implemented)
+    } else if (requestType === XP_REQUEST_TYPE.COMPONENT) {
+        // always render a single component (show missing if not implemented)
         meta.canRender = true;
-        meta.catchAll = false;  // catchAll only refers to content type catch-all
+    } else if (pageDesc) {
+        // always render a page if there is a descriptor (show missing if not implemented)
+        meta.canRender = true;
     } else if (typeDef?.view) {
         meta.canRender = true;
         meta.catchAll = true;
@@ -703,6 +711,51 @@ function errorResponse(code = '500', message = 'Unknown error',
     };
 }
 
+function restrictComponentsToPath(contentType: string, components: PageComponent[], componentPath?: string) {
+    if (!componentPath) {
+        return components;
+    }
+
+    let result: PageComponent[] = [];
+    // filter components to the requested one only
+    const component = components.find(cmp => cmp.path === componentPath);
+    if (component) {
+        result.push(component);
+        if (component.type !== XP_COMPONENT_TYPE.LAYOUT) {
+            // remember to include all parent layouts too !
+            const cmpPath = parseComponentPath(contentType, component.path);
+            for (let i = cmpPath.length - 2; i >= 0; i--) {
+                const parentPath = cmpPath[i];
+                const parentCmp = components.find(cmp => cmp.path === `/${parentPath.region}/${parentPath.index}`);
+                if (parentCmp) {
+                    result.unshift(parentCmp);
+                }
+            }
+        } else {
+            // It's a layout, include child components
+            const childCmps = components.filter(cmp => cmp.path !== component.path && cmp.path.startsWith(component.path));
+            if (childCmps.length) {
+                result = result.concat(childCmps);
+            }
+        }
+    }
+    return result;
+}
+
+const COMPONENT_PATH_KEY = '_/component';
+
+const getContentAndComponentPaths = (requestPath: string, context: Context) => {
+    let contentPath, componentPath;
+    if (requestPath.indexOf(COMPONENT_PATH_KEY) >= 0) {
+        [contentPath, componentPath] = requestPath.split(COMPONENT_PATH_KEY);
+    } else {
+        contentPath = requestPath;
+        // also check the lib-nextjs way of passing component path
+        componentPath = getSingleComponentPath(context);
+    }
+    return [contentPath, componentPath];
+};
+
 // /////////////////////////////  ENTRY 1 - THE BUILDER:
 
 /**
@@ -711,191 +764,157 @@ function errorResponse(code = '500', message = 'Unknown error',
  * @param componentRegistry ComponentRegistry object from ComponentRegistry.ts, holding user type mappings that are set in typesRegistration.ts file
  * @returns ContentFetcher
  */
-export const buildContentFetcher = <T extends AdapterConstants>(config: FetcherConfig<T>): ContentFetcher => {
+const buildContentFetcher = <T extends AdapterConstants>(config: FetcherConfig<T>): ContentFetcher => {
 
     const {
         APP_NAME,
         APP_NAME_DASHED,
-        getXPRequestType,
-        getRenderMode,
-        getSingleComponentPath,
         componentRegistry,
     } = config;
 
     return async (
-        contentPathOrArray: string | string[],
+        siteRelativeContentPath: string,
+        componentPath: string,
+        requestType: XP_REQUEST_TYPE,
+        renderMode: RENDER_MODE,
+        contentApiUrl: string,
+        xpBaseUrl: string,
         context?: Context,
     ): Promise<FetchContentResult> => {
+        const headers = getJsessionHeaders(context);
 
-        let headers;
-        const jsessionid = context?.req?.headers[JSESSIONID_HEADER];
-        if (jsessionid) {
-            headers = {
-                'Cookie': `${JSESSIONID_HEADER}=${jsessionid}`,
-            };
+        // /////////////  FIRST GUILLOTINE CALL FOR METADATA     /////////////////
+        const metaResult = await fetchMetaData(contentApiUrl, '${site}/' + siteRelativeContentPath, headers);
+        // ///////////////////////////////////////////////////////////////////////
+
+        const {_path, type} = metaResult.meta || {};
+        const contentPath = _path || siteRelativeContentPath;
+
+        if (metaResult.error) {
+            console.error(metaResult.error);
+            return errorResponse(metaResult.error.code, metaResult.error.message, requestType, renderMode, contentApiUrl, xpBaseUrl, contentPath);
         }
 
-        const xpBaseUrl = getXpBaseUrl(context);
-        const contentApiUrl = getContentApiUrl(context);
+        if (!metaResult.meta) {
+            return errorResponse('404', 'No meta data found for content, most likely content does not exist', requestType, renderMode,
+                contentApiUrl, xpBaseUrl, contentPath);
+        } else if (!type) {
+            return errorResponse('500', "Server responded with incomplete meta data: missing content 'type' attribute.", requestType,
+                renderMode, contentApiUrl, xpBaseUrl, contentPath);
 
-        const requestType = getXPRequestType(context);
-        const renderMode = getRenderMode(context);
-        let contentPath;
-
-        try {
-            const siteRelativeContentPath = getCleanContentPathArrayOrThrow400(contentPathOrArray);
-
-            let requestedComponentPath: string | undefined;
-            if (requestType === XP_REQUEST_TYPE.COMPONENT) {
-                requestedComponentPath = getSingleComponentPath(context);
-            }
-
-            // /////////////  FIRST GUILLOTINE CALL FOR METADATA     /////////////////
-            const metaResult = await fetchMetaData(contentApiUrl, '${site}/' + siteRelativeContentPath, headers);
-            // ///////////////////////////////////////////////////////////////////////
-
-            const {type, components, _path} = metaResult.meta || {};
-            contentPath = _path || '';
-
-            if (metaResult.error) {
-                console.error(metaResult.error);
-                return errorResponse(metaResult.error.code, metaResult.error.message, requestType, renderMode, contentApiUrl, xpBaseUrl, contentPath);
-            }
-
-            if (!metaResult.meta) {
-                return errorResponse('404', 'No meta data found for content, most likely content does not exist', requestType, renderMode,
-                    contentApiUrl, xpBaseUrl, contentPath);
-
-            } else if (!type) {
-                return errorResponse('500', "Server responded with incomplete meta data: missing content 'type' attribute.", requestType,
-                    renderMode, contentApiUrl, xpBaseUrl, contentPath);
-
-            } else if (renderMode === RENDER_MODE.NEXT && !IS_DEV_MODE &&
-                (type === FRAGMENT_CONTENTTYPE_NAME ||
-                    type === PAGE_TEMPLATE_CONTENTTYPE_NAME ||
-                    type === PAGE_TEMPLATE_FOLDER)) {
-                return errorResponse('404', `Content type [${type}] is not accessible in ${renderMode} mode`, requestType, renderMode,
-                    contentApiUrl, xpBaseUrl, contentPath);
-            }
-
-
-            // //////////////////////////////////////////////////  Content type established. Proceed to data call:
-
-            const allDescriptors: ComponentDescriptor[] = [];
-
-            // Add the content type query at all cases
-            const contentTypeDef = componentRegistry?.getContentType(type);
-            const pageCmp = (components || []).find(cmp => cmp.type === XP_COMPONENT_TYPE.PAGE);
-            if (pageCmp) {
-                processComponentConfig(APP_NAME, APP_NAME_DASHED, pageCmp);
-            }
-
-            const contentQueryAndVars = getQueryAndVariables(type, contentPath, contentTypeDef?.query, context, pageCmp?.page?.config);
-            if (contentQueryAndVars) {
-                allDescriptors.push({
-                    type: contentTypeDef,
-                    queryAndVariables: contentQueryAndVars,
-                });
-            }
-
-            const commonQueryAndVars = getQueryAndVariables(type, contentPath, componentRegistry.getCommonQuery(), context,
-                pageCmp?.page?.config);
-            if (commonQueryAndVars) {
-                allDescriptors.push({
-                    type: contentTypeDef,
-                    queryAndVariables: commonQueryAndVars,
-                });
-            }
-
-            if (components?.length && componentRegistry) {
-                for (const cmp of (components || [])) {
-                    processComponentConfig(APP_NAME, APP_NAME_DASHED, cmp);
-                }
-                // Collect component queries if defined
-                const componentDescriptors = collectComponentDescriptors(components, componentRegistry, requestedComponentPath, contentPath,
-                    context);
-                if (componentDescriptors.length) {
-                    allDescriptors.push(...componentDescriptors);
-                }
-            }
-
-            const {query, variables} = combineMultipleQueries(allDescriptors);
-
-            if (!query.trim()) {
-                return errorResponse('400', `Missing or empty query override for content type ${type}`, requestType, renderMode,
-                    contentApiUrl, xpBaseUrl, contentPath);
-            }
-
-            // ///////////////    SECOND GUILLOTINE CALL FOR DATA   //////////////////////
-            const contentResults = await fetchContentData(contentApiUrl, contentPath, query, variables, headers);
-            // ///////////////////////////////////////////////////////////////////////////
-
-            if (contentResults.error) {
-                console.error(contentResults.error);
-                return errorResponse(contentResults.error.code, contentResults.error.message, requestType, renderMode, contentApiUrl, xpBaseUrl, contentPath);
-            }
-
-            // Apply processors to every component
-            const datas = await applyProcessors(allDescriptors, contentResults, context);
-
-            //  Unwind the data back to components
-
-            let contentData = null, common = null;
-            let startFrom = 0;
-            if (contentQueryAndVars) {
-                const item = datas[startFrom];
-                contentData = item.status === 'fulfilled' ? item.value : item.reason;
-                startFrom++;
-            }
-            if (commonQueryAndVars) {
-                const item = datas[startFrom];
-                common = item.status === 'fulfilled' ? item.value : item.reason;
-                startFrom++;
-            }
-
-            for (let i = startFrom; i < datas.length; i++) {
-                // component descriptors hold references to components
-                // that will later be used for creating page regions
-                const datum = datas[i];
-                if (datum.status === 'rejected') {
-                    let reason = datum.reason;
-                    if (reason instanceof Error) {
-                        reason = reason.message;
-                    } else if (typeof reason !== 'string') {
-                        reason = String(reason);
-                    }
-                    allDescriptors[i].component.error = reason;
-                } else {
-                    allDescriptors[i].component.data = datum.value;
-                }
-            }
-
-            const page = createPageData(type, components);
-            const meta = createMetaData(type, siteRelativeContentPath, requestType, renderMode, contentApiUrl, xpBaseUrl, requestedComponentPath, page, components);
-
-            return {
-                data: contentData,
-                common,
-                meta,
-                page: page || null,
-            } as FetchContentResult;
-
-            // ///////////////////////////////////////////////////////////  Catch
-
-        } catch (e: any) {
-            console.error(e);
-
-            let error;
-            try {
-                error = JSON.parse(e.message);
-            } catch (e2) {
-                error = {
-                    code: 'Local',
-                    message: e.message,
-                };
-            }
-            return errorResponse(error.code, error.message, requestType, renderMode, contentApiUrl, xpBaseUrl, contentPath);
+        } else if (renderMode === RENDER_MODE.NEXT && !IS_DEV_MODE &&
+            (type === FRAGMENT_CONTENTTYPE_NAME ||
+                type === PAGE_TEMPLATE_CONTENTTYPE_NAME ||
+                type === PAGE_TEMPLATE_FOLDER)) {
+            return errorResponse('404', `Content type [${type}] is not accessible in ${renderMode} mode`, requestType, renderMode,
+                contentApiUrl, xpBaseUrl, contentPath);
         }
+
+        const components = restrictComponentsToPath(type, metaResult.meta.components, componentPath);
+        if (!components.length) {
+            // component was not found
+            return errorResponse('404', `Component ${componentPath} was not found`, requestType, renderMode, contentApiUrl, xpBaseUrl, contentPath);
+        }
+
+        // //////////////////////////////////////////////////  Content type established. Proceed to data call:
+
+        const allDescriptors: ComponentDescriptor[] = [];
+
+        // Add the content type query at all cases
+        const contentTypeDef = componentRegistry?.getContentType(type);
+        const pageCmp = (components || []).find(cmp => cmp.type === XP_COMPONENT_TYPE.PAGE);
+        if (pageCmp) {
+            processComponentConfig(APP_NAME, APP_NAME_DASHED, pageCmp);
+        }
+
+        const contentQueryAndVars = getQueryAndVariables(type, contentPath, contentTypeDef?.query, context, pageCmp?.page?.config);
+        if (contentQueryAndVars) {
+            allDescriptors.push({
+                type: contentTypeDef,
+                queryAndVariables: contentQueryAndVars,
+            });
+        }
+
+        const commonQueryAndVars = getQueryAndVariables(type, contentPath, componentRegistry.getCommonQuery(), context,
+            pageCmp?.page?.config);
+        if (commonQueryAndVars) {
+            allDescriptors.push({
+                type: contentTypeDef,
+                queryAndVariables: commonQueryAndVars,
+            });
+        }
+
+        if (components?.length && componentRegistry) {
+            for (const cmp of (components || [])) {
+                processComponentConfig(APP_NAME, APP_NAME_DASHED, cmp);
+            }
+            // Collect component queries if defined
+            const componentDescriptors = collectComponentDescriptors(components, componentRegistry, contentPath, context);
+            if (componentDescriptors.length) {
+                allDescriptors.push(...componentDescriptors);
+            }
+        }
+
+        const {query, variables} = combineMultipleQueries(allDescriptors);
+
+        if (!query.trim()) {
+            return errorResponse('400', `Missing or empty query override for content type ${type}`, requestType, renderMode,
+                contentApiUrl, xpBaseUrl, contentPath);
+        }
+
+        // ///////////////    SECOND GUILLOTINE CALL FOR DATA   //////////////////////
+        const contentResults = await fetchContentData(contentApiUrl, contentPath, query, variables, headers);
+        // ///////////////////////////////////////////////////////////////////////////
+
+        if (contentResults.error) {
+            console.error(contentResults.error);
+            return errorResponse(contentResults.error.code, contentResults.error.message, requestType, renderMode, contentApiUrl, xpBaseUrl, contentPath);
+        }
+
+        // Apply processors to every component
+        const datas = await applyProcessors(allDescriptors, contentResults, context);
+
+        //  Unwind the data back to components
+
+        let contentData = null, common = null;
+        let startFrom = 0;
+        if (contentQueryAndVars) {
+            const item = datas[startFrom];
+            contentData = item.status === 'fulfilled' ? item.value : item.reason;
+            startFrom++;
+        }
+        if (commonQueryAndVars) {
+            const item = datas[startFrom];
+            common = item.status === 'fulfilled' ? item.value : item.reason;
+            startFrom++;
+        }
+
+        for (let i = startFrom; i < datas.length; i++) {
+            // component descriptors hold references to components
+            // that will later be used for creating page regions
+            const datum = datas[i];
+            if (datum.status === 'rejected') {
+                let reason = datum.reason;
+                if (reason instanceof Error) {
+                    reason = reason.message;
+                } else if (typeof reason !== 'string') {
+                    reason = String(reason);
+                }
+                allDescriptors[i].component.error = reason;
+            } else {
+                allDescriptors[i].component.data = datum.value;
+            }
+        }
+
+        const page = createPageData(type, components);
+        const meta = createMetaData(type, siteRelativeContentPath, requestType, renderMode, contentApiUrl, xpBaseUrl, componentPath, page, components);
+
+        return {
+            data: contentData,
+            common,
+            meta,
+            page,
+        } as FetchContentResult;
     };
 };
 
@@ -903,14 +922,45 @@ export const buildContentFetcher = <T extends AdapterConstants>(config: FetcherC
 // ////////////////////////////  ENTRY 2: ready-to-use fetchContent function
 
 /**
- * Default fetchContent function, built with params from imports.
+ * Default contentFetcher function, built with params from imports.
  * It runs custom content-type-specific guillotine calls against an XP guillotine endpoint, returns content data, error and some meta data
  * Sends one query to the guillotine API and asks for content type, then uses the type to select a second query and variables, which is sent to the API and fetches content data.
  * @param contentPath string or string array: local (site-relative) path to a content available on the API (by XP _path - obtainable by running contentPath through getXpPath). Pre-split into string array, or already a slash-delimited string.
  * @param context object from Next, contains .query info
  * @returns FetchContentResult object: {data?: T, error?: {code, message}}
  */
-export const fetchContent: ContentFetcher = buildContentFetcher<AdapterConstants>({
+const contentFetcher: ContentFetcher = buildContentFetcher<AdapterConstants>({
     ...adapterConstants,
     componentRegistry: ComponentRegistry,
 });
+
+export const fetchContent = (contentPathOrArray: string | string[], context: Context) => {
+    const xpBaseUrl = getXpBaseUrl(context);
+    const contentApiUrl = getContentApiUrl(context);
+    let requestType = getXPRequestType(context);
+    const renderMode = getRenderMode(context);
+
+    try {
+        const requestContentPath = getCleanContentPathArrayOrThrow400(contentPathOrArray);
+        const [contentPath, componentPath] = getContentAndComponentPaths(requestContentPath, context);
+        if (componentPath && requestType !== XP_REQUEST_TYPE.COMPONENT) {
+            // set component request type because url contains component path
+            requestType = XP_REQUEST_TYPE.COMPONENT;
+        }
+
+        return contentFetcher(contentPath, componentPath, requestType, renderMode, contentApiUrl, xpBaseUrl, context);
+    } catch (e: any) {
+        console.error(e);
+
+        let error;
+        try {
+            error = JSON.parse(e.message);
+        } catch (e2) {
+            error = {
+                code: 'Local',
+                message: e.message,
+            };
+        }
+        return errorResponse(error.code, error.message, requestType, renderMode, contentApiUrl, xpBaseUrl, contentPathOrArray.toString());
+    }
+};
