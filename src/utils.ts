@@ -152,6 +152,21 @@ export const sanitizeGraphqlName = (text: string) => {
     return result;
 };
 
+export function notifyRenderingStarted() {
+    if (typeof window !== 'undefined') {
+        window.onload = function () {
+            // 10 msec delay to let CS init everything on window load
+            setTimeout(function () {
+                window.dispatchEvent(new Event('viewRenderingStartedEvent'));
+            }, 10);
+        };
+    }
+}
+
+export function notifyRenderingFinished() {
+    window.dispatchEvent(new Event('viewRenderingFinishedEvent'));
+}
+
 // ---------------------------------------------------------------------------------------------------------------- Export
 
 const adapterConstants = {
